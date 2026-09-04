@@ -1,0 +1,21 @@
+{
+  "name": "premiere-mcp",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Premiere Pro as an execution engine for an editing agent: MCP server -> WebSocket proxy -> UXP panel.",
+  "author": "Max Sebastian",
+  "license": "MIT",
+  "workspaces": [
+    "proxy",
+    "mcp"
+  ],
+  "scripts": {
+    "proxy": "node proxy/server.js",
+    "mcp": "node mcp/server.js",
+    "fake-panel": "node scripts/fake-panel.js",
+    "smoke": "node scripts/smoke-test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
