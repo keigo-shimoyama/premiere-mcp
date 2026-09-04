@@ -1,9 +1,37 @@
 # Premiere MCP
 
-Premiere Pro as the execution layer of an editing agent.
-Replaces an ffmpeg executor with mutation of the open Premiere project.
+An MCP server that lets Claude work inside your open Premiere Pro project.
 
-**Status:** working prototype that has been through a production run — a
+You stay in Premiere. The agent reads your real timeline, edits it in place, and
+checks its own work by rendering frames out of the Program Monitor — it is not a
+renderer, an export pipeline, or a thing that hands you a file at the end.
+
+## What you can ask it for
+
+- **"Take out the filler words and the long pauses."** Premiere's own transcript
+  already tags disfluencies; the agent turns them into cuts and applies them.
+- **"Cut a 30-second version out of these interviews."** Name the soundbites and
+  the order you want them in; `ppro_apply_cutlist` assembles the sequence in one
+  call, roughly 25 seconds of wall time.
+- **"Find where she says 'it saved my life' and cut just before it."** Phrases
+  resolve to word-level timings, and the cut point lands in the silence ahead.
+- **"What is on this timeline?"** The whole structure comes back as text —
+  tracks, clips, source ranges, timings — which a model reads far better than
+  any screenshot.
+- **"Did that land where I meant?"** It renders the frame and looks at it.
+
+**It works on a copy, not on your cut.** The composite tools duplicate the
+sequence and snapshot the `.prproj` before touching anything. The primitives
+leave that to the caller — start a chain of them with `ppro_snapshot_create`.
+
+The API underneath has calls that look documented and will corrupt a project
+irreversibly. They are catalogued in [docs/api-traps.md](docs/api-traps.md). The
+composite tools route around them — `ppro_reorder` clones rather than moving,
+because moving corrupts — while the primitives that can still reach them
+(`ppro_move_at`, `ppro_retrim`) say so in their own descriptions. Read the traps
+before extending anything.
+
+**Status:** a working prototype that has been through a production run — a
 30-second draft assembled from a transcript on real material, both step by step
 (~30 min) and in a single `ppro_apply_cutlist` call (25 s). Working: timeline
 reads, snapshots, splitting, ripple delete, text-based addressing, transcript

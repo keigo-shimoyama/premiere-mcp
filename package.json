@@ -2,7 +2,7 @@
   "name": "premiere-mcp",
   "private": true,
   "version": "0.1.0",
-  "description": "Premiere Pro as an execution engine for an editing agent: MCP server -> WebSocket proxy -> UXP panel.",
+  "description": "An MCP server that lets Claude edit inside an open Premiere Pro project: MCP server -> WebSocket proxy -> UXP panel.",
   "author": "Max Sebastian",
   "license": "MIT",
   "workspaces": [
