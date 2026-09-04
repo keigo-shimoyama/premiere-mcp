@@ -196,6 +196,65 @@ relay("ppro_sequence_rename", {
   },
 }, "sequence.rename");
 
+relay("ppro_capabilities", {
+  title: "Probe what this Premiere host can actually do",
+  description:
+    "Reports which newer or undocumented API surfaces exist in the connected host: scene-edit detection and its operation constants, the Markers statics, track mute, track-item speed accessors, project import and preset-based sequence creation. Package version and TypeScript declarations are not evidence — the same declarations ship to hosts that lack the binding, so check here before relying on any of these.",
+  inputSchema: {},
+}, "capabilities.get");
+
+relay("ppro_scene_detect", {
+  title: "Run Premiere's scene-edit detection",
+  description:
+    "Runs Premiere's own scene-edit detection over a selection and has it apply cuts, drop markers, or make subclips. Cuts land where Premiere DETECTS a scene change — this is not a razor you can aim, so use ppro_split_at to cut at a chosen time. Verified on 26.3.2: only VIDEO items are cut even when audio is selected, leaving the linked pair structurally divergent; and the operation is NOT idempotent — a second run re-cuts material it already cut and leaves one-frame slivers, which the result reports. DIRECT HOST OPERATION, not a transaction: undo is not guaranteed, so take ppro_snapshot_create first and run it once, on undetected material. MUTATES the active sequence.",
+  inputSchema: {
+    operation: z.enum(["cuts", "markers", "subclips"]).optional()
+      .describe("What detection produces (default cuts)"),
+    track: z.string().optional().describe('Select every clip on this track, e.g. "V0", instead of using the timeline selection'),
+    tracks: z.array(z.string()).optional()
+      .describe('Several tracks, e.g. ["V0","A0"] — detection cuts only what is selected, so pass the linked audio track too or the pair ends up structurally divergent'),
+    index: z.number().int().nonnegative().optional().describe("With track/tracks: select only this clip index"),
+  },
+}, "scene.detect");
+
+relay("ppro_markers_list", {
+  title: "List sequence markers",
+  description: "Read-only list of the markers on the active sequence with guid, name, type, start and comments.",
+  inputSchema: {},
+}, "markers.list");
+
+relay("ppro_marker_add", {
+  title: "Add a sequence marker",
+  description:
+    "Adds a marker to the active sequence in one transaction and verifies it by re-reading the marker list. Useful for handing review points back to the editor rather than mutating their cut.",
+  inputSchema: {
+    name: z.string().describe("Marker name"),
+    atSeconds: z.number().optional().describe("Sequence time (default 0)"),
+    durationSeconds: z.number().optional().describe("Marker duration; 0 makes it a point marker"),
+    comments: z.string().optional(),
+    type: z.string().optional().describe("Marker type constant; defaults to Comment"),
+  },
+}, "markers.add");
+
+relay("ppro_markers_remove", {
+  title: "Remove sequence markers",
+  description: "Removes markers by guid (or all of them) in one transaction, verified by re-counting. Pair it with ppro_markers_list to clean up review markers the agent left behind.",
+  inputSchema: {
+    guid: z.string().optional().describe("Single marker guid"),
+    guids: z.array(z.string()).optional().describe("Several marker guids"),
+    all: z.boolean().optional().describe("Remove every marker on the active sequence"),
+  },
+}, "markers.remove");
+
+relay("ppro_track_mute", {
+  title: "Mute or unmute a track",
+  description: "Sets a track's mute flag and reads it back. Not a transaction — this is player state, not project state.",
+  inputSchema: {
+    track: z.string().optional().describe('Track id, e.g. "A0" (default A0)'),
+    muted: z.boolean().optional().describe("Default true"),
+  },
+}, "track.setMute");
+
 relay("ppro_sequence_delete", {
   title: "Delete a sequence",
   description: "Removes a sequence from the project. Intended for cleaning up agent scratch sequences.",
@@ -652,6 +711,32 @@ server.registerTool("ppro_apply_cutlist", {
     }
     if (chrono[0].start > 0.02) cuts.push({ start: 0, end: chrono[0].start, head: true });
 
+    // Identity of every planned segment, in SOURCE coordinates AND with the
+    // project item it comes from. Source times are ripple-proof; the project
+    // item id is what tells two clips apart when both start at srcIn 0 in
+    // different files — which is the normal case for a stringout of takes.
+    // Without the id the sweep below reads every clip as a duplicate of the
+    // first and deletes the whole timeline.
+    const sorted0 = [...rows0].sort((a, b) => a.start.seconds - b.start.seconds);
+    // A dry run against a sequence other than the active one has no rows to
+    // resolve against; the real path always does (the empty check above throws).
+    const plan = !sorted0.length ? [] : chrono.map((k) => {
+      // Match on the midpoint, and allow a frame of slack at the edges: callers
+      // work from timings rounded to hundredths, while clip boundaries sit on
+      // frames (211.8333, not 211.83). An exact containment test rejects spans
+      // that are in fact inside the clip.
+      const mid = (k.start + k.end) / 2;
+      const host = sorted0.find((i) => i.start.seconds <= mid && i.end.seconds > mid);
+      if (!host) throw new Error(`keep span [${k.start}-${k.end}] covers no clip on ${track}`);
+      if (k.start < host.start.seconds - EPS || k.end > host.end.seconds + EPS) {
+        throw new Error(`keep span [${k.start}-${k.end}] crosses a clip boundary` +
+          ` (clip ${host.name} runs ${host.start.seconds.toFixed(2)}-${host.end.seconds.toFixed(2)})` +
+          ` — spans crossing a boundary are not supported`);
+      }
+      const s0 = host.inPoint.seconds + Math.max(0, k.start - host.start.seconds);
+      return { target: k.target, pid: host.projectItemId, s0, s1: s0 + (k.end - k.start) };
+    });
+
     if (dryRun) {
       return { content: [{ type: "text", text: JSON.stringify({
         dryRun: true, keeps: chrono.length, cuts, order,
@@ -686,22 +771,36 @@ server.registerTool("ppro_apply_cutlist", {
     const sweep = async (mode) => {
       const d = await proxy.call("timeline.dump", {});
       const rows = (d.tracks.find((t) => t.id === track)?.items || [])
-        .map((i) => ({ start: i.start.seconds, end: i.end.seconds, srcIn: i.inPoint.seconds }))
+        .map((i) => ({ start: i.start.seconds, end: i.end.seconds, srcIn: i.inPoint.seconds,
+                       pid: i.projectItemId }))
         .sort((a, b) => a.start - b.start);
-      const inCutSpan = (r) => cuts.some((c) =>
-        r.srcIn > c.start - EPS && (r.srcIn + r.end - r.start) < c.end + EPS);
-      const seen = []; // source coverage of clips accepted as legit, in timeline order
-      const dupOfSeen = (r) => {
-        const s0 = r.srcIn, s1 = r.srcIn + (r.end - r.start);
-        return seen.some(([a, b]) => s0 < b - EPS && s1 > a + EPS);
-      };
+      // Positive test: a clip survives if it IS, or still CONTAINS, a planned
+      // segment of the same project item that no earlier clip has claimed.
+      // Each plan entry can be claimed once, so a stacked clone of an accepted
+      // segment finds nothing left and is reaped. Mid-run the test is "contains"
+      // (legit material may not be trimmed to size yet); after the cuts it is
+      // an exact match.
+      const len = (r) => r.end - r.start;
+      const isExact = (r, e) => r.pid === e.pid &&
+        Math.abs(r.srcIn - e.s0) < EPS && Math.abs(len(r) - (e.s1 - e.s0)) < EPS * 2;
+      const contains = (r, e) => r.pid === e.pid &&
+        r.srcIn <= e.s0 + EPS && r.srcIn + len(r) >= e.s1 - EPS;
+      const match = mode === "keeps" ? isExact : contains;
+      const claimed = new Set();
       const orphans = [];
       for (const r of rows) {
-        const isOrphan = inCutSpan(r) || dupOfSeen(r) ||
-          (mode === "keeps" && !chrono.some((k) => Math.abs(r.srcIn - k.start) < EPS &&
-            Math.abs((r.end - r.start) - (k.end - k.start)) < EPS * 2));
-        if (isOrphan) orphans.push(r);
-        else seen.push([r.srcIn, r.srcIn + (r.end - r.start)]);
+        const j = plan.findIndex((e, i) => !claimed.has(i) && match(r, e));
+        if (j === -1) orphans.push(r);
+        else claimed.add(j);
+      }
+      // Guard. The sweep is a heuristic over undocumented behaviour; when it
+      // decides that almost the whole timeline is debris, the heuristic is
+      // wrong, not the timeline. Two separate identity bugs here each ended in
+      // an emptied sequence before this check existed.
+      if (orphans.length && rows.length - orphans.length < plan.length) {
+        throw new Error(`sweep refused: it would remove ${orphans.length} of ${rows.length} clips,` +
+          ` leaving fewer than the ${plan.length} planned segments — the orphan test is wrong,` +
+          ` not the timeline`);
       }
       let removed = 0;
       for (const o of orphans) {
@@ -749,8 +848,9 @@ server.registerTool("ppro_apply_cutlist", {
 
     const swept = await sweep("keeps");
 
-    let gaps = await proxy.call("timeline.closeGaps", {});
-    log.push({ step: "closeGaps", gapsClosed: gaps.gapsClosed, segments: gaps.segments });
+    let gaps = await callRetry("timeline.closeGaps", {});
+    log.push({ step: "closeGaps", ok: gaps.ok, gapsClosed: gaps.gapsClosed, segments: gaps.segments });
+    if (!gaps.ok) throw new Error(`closeGaps failed: ${gaps.error}`);
     if (gaps.segments !== chrono.length) {
       throw new Error(`expected ${chrono.length} segments after cuts, found ${gaps.segments}`);
     }
@@ -793,24 +893,30 @@ server.registerTool("ppro_apply_cutlist", {
         });
         if (!r.ok) throw new Error(`reorder removal at ${seg.start.toFixed(2)} failed: ${r.error}`);
       }
-      gaps = await proxy.call("timeline.closeGaps", {});
-      log.push({ step: "reorder", segments: gaps.segments });
+      gaps = await callRetry("timeline.closeGaps", {});
+      log.push({ step: "reorder", ok: gaps.ok, segments: gaps.segments });
+      if (!gaps.ok) throw new Error(`closeGaps after reorder failed: ${gaps.error}`);
     }
 
     // --- verify against the plan -----------------------------------------
     const final = await proxy.call("timeline.dump", {});
     const now = (final.tracks.find((t) => t.id === track)?.items || [])
-      .map((i) => ({ start: i.start.seconds, end: i.end.seconds, srcIn: i.inPoint.seconds }))
+      .map((i) => ({ start: i.start.seconds, end: i.end.seconds, srcIn: i.inPoint.seconds,
+                     pid: i.projectItemId }))
       .sort((a, b) => a.start - b.start);
     const segments = now.map((n, j) => {
       const want = keeps[j];
+      // Position j must hold keeps[j]; its expected source identity is the plan
+      // entry that targets j. Comparing srcIn against the keep's TIMELINE start
+      // only worked while the timeline was one clip from one file.
+      const e = plan.find((x) => x.target === j);
       return {
         position: j,
         label: want?.label,
         start: Number(n.start.toFixed(2)),
         srcIn: Number(n.srcIn.toFixed(2)),
-        matchesPlan: !!want && Math.abs(n.srcIn - want.start) < EPS &&
-          Math.abs((n.end - n.start) - (want.end - want.start)) < EPS * 2,
+        matchesPlan: !!e && n.pid === e.pid && Math.abs(n.srcIn - e.s0) < EPS &&
+          Math.abs((n.end - n.start) - (e.s1 - e.s0)) < EPS * 2,
       };
     });
     const ok = now.length === keeps.length && segments.every((s) => s.matchesPlan);

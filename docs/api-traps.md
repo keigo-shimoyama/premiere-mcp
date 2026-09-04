@@ -20,6 +20,13 @@ silently does nothing. The clone is simply never created, and you get `ok: true`
 
 **Rule:** acquire everything that goes stale **inside** `lockedAccess`.
 
+Adobe enforces this: 26.3 tightened `create*Action()` to require locked state,
+and `@adobe/eslint-plugin-premierepro` ships rules that flag construction
+outside the lock, actions escaping their lock scope, and async callbacks passed
+to `lockedAccess` / `executeTransaction`. Run `npm run lint` before believing a
+failure here is a mystery — two entries in this file (§10, and the `trimHead`
+regression) turned out to be this rule rather than staleness.
+
 ```js
 project.lockedAccess(() => {
   const editor = ppro.SequenceEditor.getEditor(sequence);   // inside!
@@ -131,6 +138,22 @@ stretched to out 34.5).
 Neither `createSplitAction` nor a razor exists. Verified by enumerating the
 prototype chain at runtime — there are no hidden methods.
 
+**There is, however, one documented way to make Premiere cut the timeline
+itself**: `SequenceUtils.performSceneEditDetectionOnSelection(operation,
+selection)` with `SEQUENCE_OPERATION_APPLYCUT`. Verified cutting on 26.3.2. It
+does not replace the emulation below, because you cannot aim it — it cuts where
+Premiere detects a scene change, not at a time you choose. Three constraints,
+all observed live:
+
+- **Video only.** Audio items are never cut, even when they are in the
+  selection, so the linked pair ends up structurally divergent (§4).
+- **Not idempotent.** A second run re-cuts material it already cut and leaves a
+  one-frame sliver at the old cut point. Run it once, on undetected material.
+- **Not a transaction.** Undo is not guaranteed; snapshot first.
+
+Useful for rushes and stringouts of flattened exports. Useless for "cut at
+12.4s" — that is what the emulation below is for.
+
 **Emulating a cut** (`timeline.splitAt`):
 
 ```
@@ -175,10 +198,13 @@ Subclips (`createSubClipAction`) bloat the project and break Collect & Share.
 Make edits **in place, in a duplicate of the sequence** — track item clones
 reference the same footage.
 
-**Unresolved:** `FolderItem.createRemoveItemAction()` consistently fails with
-`The script object is no longer valid.` (`getItems()` is asynchronous and
-cannot be re-acquired inside the lock). `project.deleteSequence()` works,
-though. For now, project items have to be deleted by hand.
+**Resolved, 2026-09-04.** `FolderItem.createRemoveItemAction()` was recorded
+here as failing with `The script object is no longer valid.` — read as a stale
+handle. It was not: the action was being **built outside `lockedAccess`**, which
+26.3 forbids (§1). Fetch the items with the async `getItems()` outside, then
+build the actions inside the lock, awaiting nothing in between. Verified live:
+a scratch sequence's project item was removed and the read-back list came back
+empty. Adobe's lint rule finds this class of bug statically.
 
 ## 11. The transcript belongs to the source, not the sequence
 
@@ -189,6 +215,27 @@ mandatory — see [mcp/timemap.js](../mcp/timemap.js).
 Transcript timings are in **source seconds**. Edits are in timeline seconds.
 They coincide only while the clip sits at 0 with `srcIn = 0`, i.e. until the
 very first edit.
+
+**Correction, 2026-09-04.** The statement above holds for the `Sequence` *type*,
+but not for the project. A sequence also has a **project item**, and Premiere can
+attach a transcript to it: on a 40-clip sequence, `exportToJSON` on the
+sequence's own project item returned 40 segments, 40 speakers and 711 words
+whose last word ends at 256.87 s — exactly the sequence duration. That transcript
+is in **timeline time**, so where one exists the mapping layer is not needed.
+
+It has to be requested in Premiere (Text panel -> Transcribe, with the sequence
+selected), and it **follows the edits**: after `trimHead(3.0)` on a duplicate the
+sequence transcript came back with 697 words instead of 711, ending at 253.87 s
+(the new duration), its first word being the one that previously sat at 3.12 s.
+It is a live view of the timeline, not a snapshot taken at transcription time.
+
+A duplicate inherits it, so `ppro_sequence_duplicate` carries the transcript into
+the working copy.
+
+Where a sequence transcript exists, edits can be planned directly in timeline
+seconds and re-read after every batch — no `source -> sequence` mapping at all.
+[mcp/timemap.js](../mcp/timemap.js) remains the path for clip-level transcripts,
+which is what you get when the sequence has never been transcribed.
 
 ## 12. `Application.version` does not work
 

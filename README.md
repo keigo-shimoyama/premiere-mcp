@@ -92,7 +92,13 @@ npm run proxy
 |---|---|
 | `panel/*.js`, `*.html`, `*.css` | Watch reloads it; otherwise Reload in UDT |
 | `panel/manifest.json` | **Unload -> Load** (Watch does not cover the manifest) |
-| `mcp/`, `proxy/`, `scripts/` | nothing — the MCP server starts fresh on every call |
+| `mcp/`, `proxy/`, `scripts/` | depends on how you call it — see below |
+
+> **A registered MCP server is a persistent process.** It starts once, when the
+> client session starts, and keeps running: editing `mcp/server.js` does NOT
+> affect the tools your client already has. Restart the client session, or call
+> through `node scripts/call.mjs`, which spawns a fresh server per call. Three
+> debugging runs were once spent on code that was never executing.
 
 > Watch misfires sometimes. If a new command answers `unknown command: ...`,
 > hit Reload by hand.
@@ -130,6 +136,18 @@ Without Premiere only the plumbing can be tested:
 npm run fake-panel   # in a separate terminal
 npm run smoke
 ```
+
+### Linting
+
+```bash
+npm run lint
+```
+
+Adobe's own rules (`@adobe/eslint-plugin-premierepro`) for the premierepro API:
+actions built outside `lockedAccess`, actions escaping their lock scope, async
+callbacks where the API demands synchronous ones. These are the failures
+api-traps §1 and §3 describe, caught statically. One entry in that file (§10)
+turned out to be a lint error rather than the API trap it was recorded as.
 
 ---
 
@@ -189,6 +207,17 @@ npm run smoke
 |---|---|
 | `ppro_debug_invoke` | reflective API method call without committing |
 | `ppro_debug_arity` | arity of the `SequenceEditor` methods |
+| `ppro_capabilities` | what this host actually has at runtime — declarations are not evidence |
+
+### Markers, tracks, detection
+
+| Tool | Purpose |
+|---|---|
+| `ppro_markers_list` | markers on the active sequence |
+| `ppro_marker_add` | add a marker, verified by re-reading |
+| `ppro_markers_remove` | remove markers by guid, or all of them |
+| `ppro_track_mute` | mute/unmute a track |
+| `ppro_scene_detect` | Premiere's own scene-edit detection: cuts, markers or subclips. Video only, not aimable, not idempotent, not undoable — read api-traps §6 first |
 
 ---
 

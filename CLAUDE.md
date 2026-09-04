@@ -39,9 +39,15 @@ proxy/server.js   command broker
 panel/main.js     primitives over the premierepro API  <- no logic
 ```
 
-The reason is not stylistic: `mcp/` restarts on every call, while `panel/`
-needs a plugin Reload inside Premiere. Anything that can be solved on the MCP
-side is solved on the MCP side.
+The reason is not stylistic: `panel/` needs a plugin Reload inside Premiere,
+while `mcp/` can be reloaded far more cheaply. Anything that can be solved on
+the MCP side is solved on the MCP side.
+
+**But a registered MCP server is a persistent process**, started once with the
+client session. Editing `mcp/server.js` does not change the tools the client
+already holds — restart the session, or call through `node scripts/call.mjs`,
+which spawns a fresh server per call. Three debugging runs were once spent on
+code that was never executing.
 
 Editing `panel/*.js` -> Reload in UDT. Editing `panel/manifest.json` -> Unload
 then Load. If a new command answers `unknown command:`, the panel did not
@@ -63,3 +69,10 @@ npm run smoke
 
 This exercises the MCP -> proxy -> panel plumbing. It does not cover the real
 editing logic: the fake panel serves canned answers.
+
+```bash
+npm run lint
+```
+
+Adobe's own lint rules for this API. Run them before treating a lock-related
+failure as a mystery: two entries in api-traps turned out to be lint errors.

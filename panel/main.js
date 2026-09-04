@@ -652,7 +652,11 @@ const commands = {
     }
 
     return {
-      ok: !trimError && !rippleError && after.length > 0 && after.every((a) => Math.abs(a.start) < 0.05),
+      // The head is closed when the EARLIEST clip sits at the origin. Requiring
+      // it of every clip only held on a single-clip test sequence; on a real
+      // timeline it reported ok:false for a perfectly good trim.
+      ok: !trimError && !rippleError && after.length > 0 &&
+        Math.min(...after.map((a) => a.start)) < 0.05,
       trimError,
       rippleError,
       trimmed: toTrim.length,
@@ -691,17 +695,24 @@ const commands = {
       const freshRoot = await project.getRootItem();
       const items = await freshRoot.getItems();
       const targets = items.filter((i) => names.includes(i.name));
-      // An item must be removed from its actual parent bin, not from root.
-      // getParentBin is synchronous, so this adds no await to go stale across.
-      const actions = targets.map((i) => {
-        const parent = i.getParentBin() || freshRoot;
-        return parent.createRemoveItemAction(i);
-      });
       const doomed = targets.map((i) => ({ name: i.name }));
+      // Build the actions INSIDE the lock. 26.3 tightened create*Action() to
+      // require locked state, and Adobe's own lint rule
+      // (@adobe/premierepro/require-action-lock-scope) flags construction
+      // outside it. The failure this produced here — "The script object is no
+      // longer valid" — read like a stale handle and was recorded as such;
+      // it is the lock rule, not staleness. getItems() is async so the fetch
+      // stays outside, but nothing is awaited between it and the lock.
       project.lockedAccess(() => {
+        const actions = targets.map((i) => {
+          // getParentBin is synchronous, so it is safe in here. An item must be
+          // removed from its actual parent bin, not from root.
+          const parent = i.getParentBin() || freshRoot;
+          return parent.createRemoveItemAction(i);
+        });
         project.executeTransaction((tx) => {
           for (const a of actions) tx.addAction(a);
-        }, `agent: remove ${actions.length} scratch item(s)`);
+        }, `agent: remove ${targets.length} scratch item(s)`);
       });
     } catch (e) {
       err = e?.message || String(e);
@@ -940,7 +951,13 @@ const commands = {
       return out;
     };
 
-    /** Runs one transaction, re-acquiring items by index inside the lock. */
+    /**
+     * Runs one transaction, re-acquiring items by index inside the lock.
+     *
+     * Every `make` callback below is invoked HERE, inside lockedAccess. Adobe's
+     * require-action-lock-scope rule cannot follow that indirection and reports
+     * the call sites instead, so they carry eslint-disable-next-line.
+     */
     const commit = (tracks, pick, label) => {
       project.lockedAccess(() => {
         // getEditor is synchronous, so take it inside the lock — an editor
@@ -974,6 +991,7 @@ const commands = {
     const cloneTargets = Object.fromEntries(
       state.map((t) => [t.id, t.rows.filter(spans).map((r) => ({
         index: r.index,
+        // eslint-disable-next-line @adobe/premierepro/require-action-lock-scope -- commit() runs this inside lockedAccess
         make: (it, editor) => editor.createCloneTrackItemAction(it, offset, 0, 0, true, false),
       }))])
     );
@@ -1001,8 +1019,10 @@ const commands = {
     const atTick = ppro.TickTime.createWithSeconds(at);
     const atShifted = ppro.TickTime.createWithSeconds(at + F);
     const trims = Object.fromEntries(state.map((t) => [t.id, [
+      // eslint-disable-next-line @adobe/premierepro/require-action-lock-scope -- commit() runs this inside lockedAccess
       ...t.rows.filter(spans).map((r) => ({ index: r.index, make: (it) => it.createSetEndAction(atTick) })),
       ...t.rows.filter((r) => r.start >= F - 1e-6)
+        // eslint-disable-next-line @adobe/premierepro/require-action-lock-scope -- commit() runs this inside lockedAccess
         .map((r) => ({ index: r.index, make: (it) => it.createSetStartAction(atShifted) })),
     ]]));
     try {
@@ -1016,6 +1036,7 @@ const commands = {
     const backShift = ppro.TickTime.createWithSeconds(-F);
     const moves = Object.fromEntries(state.map((t) => [t.id,
       t.rows.filter((r) => r.start >= F - 1e-6)
+        // eslint-disable-next-line @adobe/premierepro/require-action-lock-scope -- commit() runs this inside lockedAccess
         .map((r) => ({ index: r.index, make: (it) => it.createMoveAction(backShift) })),
     ]));
     try {
@@ -1516,7 +1537,267 @@ const commands = {
       head: JSON.stringify(parsed).slice(0, Number(params.headBytes ?? 3000)),
     };
   },
+
+  /**
+   * Reports which newer or undocumented API surfaces this host actually has.
+   *
+   * Package version and TypeScript declarations are not evidence: the same
+   * declaration ships to hosts that lack the binding. Anything built on a
+   * surface listed here should probe it rather than assume it.
+   */
+  async "capabilities.get"() {
+    const has = (o, k) => !!o && typeof o[k] !== "undefined";
+    const seqUtils = ppro.SequenceUtils || null;
+    const project = await ppro.Project.getActiveProject();
+    const sequence = project ? await project.getActiveSequence() : null;
+    let anyItem = null, audioTrack = null;
+    if (sequence) {
+      const vt = await sequence.getVideoTrack(0);
+      anyItem = (vt && (vt.getTrackItems(ppro.Constants.TrackItemType.CLIP, false) || [])[0]) || null;
+      audioTrack = await sequence.getAudioTrack(0);
+    }
+    return {
+      sceneEditDetection: {
+        method: has(seqUtils, "performSceneEditDetectionOnSelection"),
+        applyCut: has(seqUtils, "SEQUENCE_OPERATION_APPLYCUT"),
+        createMarker: has(seqUtils, "SEQUENCE_OPERATION_CREATEMARKER"),
+        createSubClip: has(seqUtils, "SEQUENCE_OPERATION_CREATESUBCLIP"),
+      },
+      markers: { statics: has(ppro, "Markers"), getMarkers: has(ppro.Markers, "getMarkers") },
+      trackState: { setMute: has(audioTrack, "setMute"), isMuted: has(audioTrack, "isMuted") },
+      trackItem: {
+        getSpeed: has(anyItem, "getSpeed"),
+        isSpeedReversed: has(anyItem, "isSpeedReversed"),
+        // No setter in 26.3 — retiming is the one capability that stays QE-only.
+        setSpeed: has(anyItem, "setSpeed") || has(anyItem, "createSetSpeedAction"),
+      },
+      project: {
+        importFiles: has(project, "importFiles"),
+        createSequenceWithPresetPath: has(project, "createSequenceWithPresetPath"),
+      },
+    };
+  },
+
+  /**
+   * Premiere's own scene-edit detection, run over a selection.
+   *
+   * This is the only documented path that makes Premiere cut the timeline
+   * itself — there is still no createSplitAction (api-traps §6). It is a direct
+   * host operation, NOT a transaction: undo is not guaranteed, so snapshot
+   * first. `operation` picks what detection produces: cuts, markers, subclips.
+   */
+  async "scene.detect"(params) {
+    const project = await ppro.Project.getActiveProject();
+    const sequence = await project.getActiveSequence();
+    const utils = ppro.SequenceUtils;
+    if (!utils || typeof utils.performSceneEditDetectionOnSelection !== "function") {
+      throw new Error("performSceneEditDetectionOnSelection is not available on this host");
+    }
+    const opMap = {
+      cuts: utils.SEQUENCE_OPERATION_APPLYCUT,
+      markers: utils.SEQUENCE_OPERATION_CREATEMARKER,
+      subclips: utils.SEQUENCE_OPERATION_CREATESUBCLIP,
+    };
+    const wanted = params.operation || "cuts";
+    const clipOperation = opMap[wanted];
+    if (!clipOperation) throw new Error(`operation must be one of ${Object.keys(opMap).join(", ")}`);
+
+    // Detection cuts exactly what is selected, so a video-only selection leaves
+    // the linked audio uncut and the pair structurally divergent (§4). Accept a
+    // list of tracks and default to selecting the audio counterpart too.
+    const ids = params.tracks || (params.track ? [params.track] : null);
+    let selection = null;
+    if (ids) {
+      const resolved = [];
+      for (const id of ids) {
+        const kind = id[0].toUpperCase();
+        const idx = Number(id.slice(1));
+        const t = kind === "V" ? await sequence.getVideoTrack(idx) : await sequence.getAudioTrack(idx);
+        if (!t) throw new Error(`no track ${id}`);
+        resolved.push(t);
+      }
+      // Build the selection inside the lock (items go stale across an await),
+      // then hand it to Premiere. setSelection is synchronous on 26.3, so it
+      // fits in the same locked scope.
+      project.lockedAccess(() => {
+        ppro.TrackItemSelection.createEmptySelection((sel) => { selection = sel; });
+        const only = params.index === undefined ? null : Number(params.index);
+        for (const t of resolved) {
+          const items = t.getTrackItems(ppro.Constants.TrackItemType.CLIP, false) || [];
+          for (let i = 0; i < items.length; i++) {
+            if (items[i] && (only === null || only === i)) selection.addItem(items[i], true);
+          }
+        }
+        sequence.setSelection(selection);
+      });
+    }
+
+    // A TrackItemSelection goes stale across an await just like a track item
+    // (§1), and the detection call is async — so the one we built cannot be
+    // passed to it. Read the live selection back, and re-read it once more
+    // immediately before the call with nothing awaited in between.
+    const counted = await sequence.getSelection();
+    const picked = counted ? (await counted.getTrackItems()).length : 0;
+    if (!picked) throw new Error("nothing selected — pass a track, or select clips in the timeline");
+
+    const before = await countClips(sequence);
+    const live = await sequence.getSelection();
+    const ok = await utils.performSceneEditDetectionOnSelection(clipOperation, live);
+    const after = await countClips(sequence);
+
+    // Two behaviours worth reporting, both observed on 26.3.2:
+    //  - only VIDEO items are cut, even when audio is in the selection, so the
+    //    linked pair ends up structurally divergent (§4);
+    //  - the operation is NOT idempotent. Run twice over the same material it
+    //    splits again at the previous cut point and leaves a one-frame sliver.
+    // Slivers are the visible symptom, so surface them rather than let the
+    // caller discover them in the Program Monitor.
+    const slivers = [];
+    if (wanted === "cuts") {
+      const vCount = await sequence.getVideoTrackCount();
+      for (let i = 0; i < vCount; i++) {
+        const t = await sequence.getVideoTrack(i);
+        for (const it of t.getTrackItems(ppro.Constants.TrackItemType.CLIP, false) || []) {
+          if (!it) continue;
+          const [st, en] = await Promise.all([it.getStartTime(), it.getEndTime()]);
+          if (en.seconds - st.seconds < 0.1) {
+            slivers.push({ track: `V${i}`, start: Number(st.seconds.toFixed(3)),
+                           length: Number((en.seconds - st.seconds).toFixed(3)) });
+          }
+        }
+      }
+    }
+    return {
+      ok: !!ok, operation: wanted, selected: picked,
+      clipsBefore: before, clipsAfter: after, clipsAdded: after - before,
+      slivers: slivers.length ? slivers : undefined,
+      warning: slivers.length
+        ? "sub-0.1s clips present — scene detection is not idempotent; it re-cuts material it already cut"
+        : undefined,
+      note: "video only (audio is never cut), direct host operation, not a transaction — undo is not guaranteed",
+    };
+  },
+
+  /** Lists the markers on the active sequence. */
+  async "markers.list"() {
+    const project = await ppro.Project.getActiveProject();
+    const sequence = await project.getActiveSequence();
+    const markers = await ppro.Markers.getMarkers(sequence);
+    const list = markers.getMarkers() || [];
+    const out = [];
+    for (const m of list) {
+      if (!m) continue;
+      // Marker exposes synchronous getters, not properties: reading m.name gave
+      // undefined, which made markers.add report failure for markers it had in
+      // fact created (api-traps §13, inverted).
+      const start = m.getStart();
+      out.push({
+        guid: String(m.guid), name: m.getName(), type: m.getType(),
+        start: Number(start.seconds.toFixed(3)), comments: m.getComments() || "",
+      });
+    }
+    return { count: out.length, markers: out.sort((a, b) => a.start - b.start) };
+  },
+
+  /**
+   * Adds a marker to the active sequence. Verified by re-reading the list: the
+   * transaction's own answer proves nothing (api-traps §13).
+   */
+  async "markers.add"(params) {
+    const project = await ppro.Project.getActiveProject();
+    const sequence = await project.getActiveSequence();
+    if (!params.name) throw new Error("a marker name is required");
+    const markers = await ppro.Markers.getMarkers(sequence);
+    const at = ppro.TickTime.createWithSeconds(Number(params.atSeconds) || 0);
+    const dur = ppro.TickTime.createWithSeconds(Number(params.durationSeconds) || 0);
+
+    // The marker-type constants live on ppro.Marker (MarkerStatic), not on
+    // Constants. Passing `undefined` for the optional argument is rejected with
+    // "Illegal Parameter type" — the native binding wants a real string, so
+    // resolve a default rather than leaving a hole in the argument list.
+    const type = params.type || ppro.Marker.MARKER_TYPE_COMMENT;
+    if (typeof type !== "string") throw new Error("no usable marker type on this host");
+
+    let err = null;
+    try {
+      project.lockedAccess(() => {
+        const action = markers.createAddMarkerAction(
+          params.name, type, at, dur, params.comments || ""
+        );
+        project.executeTransaction((tx) => tx.addAction(action), `agent: add marker ${params.name}`);
+      });
+    } catch (e) {
+      err = e?.message || String(e);
+    }
+    const after = await ppro.Markers.getMarkers(sequence);
+    const found = (after.getMarkers() || []).filter(Boolean)
+      .find((m) => m.getName() === params.name);
+    return {
+      ok: !err && !!found, error: err,
+      marker: found ? { guid: String(found.guid), name: found.getName() } : null,
+    };
+  },
+
+  /** Removes markers by guid, or every marker when `all` is set. */
+  async "markers.remove"(params) {
+    const project = await ppro.Project.getActiveProject();
+    const sequence = await project.getActiveSequence();
+    const markers = await ppro.Markers.getMarkers(sequence);
+    const list = (markers.getMarkers() || []).filter(Boolean);
+    const guids = params.guids || (params.guid ? [params.guid] : null);
+    const doomed = params.all ? list : list.filter((m) => guids && guids.includes(String(m.guid)));
+    if (!doomed.length) return { ok: true, removed: 0, note: "nothing matched" };
+
+    let err = null;
+    try {
+      project.lockedAccess(() => {
+        const actions = doomed.map((m) => markers.createRemoveMarkerAction(m));
+        project.executeTransaction((tx) => {
+          for (const a of actions) tx.addAction(a);
+        }, `agent: remove ${actions.length} marker(s)`);
+      });
+    } catch (e) {
+      err = e?.message || String(e);
+    }
+    const after = await ppro.Markers.getMarkers(sequence);
+    const left = (after.getMarkers() || []).filter(Boolean).length;
+    return { ok: !err && left === list.length - doomed.length, error: err,
+             removed: list.length - left, remaining: left };
+  },
+
+  /** Mutes or unmutes one track, verified by reading the flag back. */
+  async "track.setMute"(params) {
+    const project = await ppro.Project.getActiveProject();
+    const sequence = await project.getActiveSequence();
+    const id = params.track || "A0";
+    const kind = id[0].toUpperCase();
+    const idx = Number(id.slice(1));
+    const track = kind === "V" ? await sequence.getVideoTrack(idx) : await sequence.getAudioTrack(idx);
+    if (!track) throw new Error(`no track ${id}`);
+    if (typeof track.setMute !== "function") throw new Error(`setMute is not available on ${id}`);
+    // setMute and isMuted are both async despite looking like plain accessors.
+    const want = params.muted !== false;
+    const before = await track.isMuted();
+    await track.setMute(want);
+    const after = await track.isMuted();
+    return { ok: after === want, track: id, before, after };
+  },
 };
+
+/** Total clip count across every track — cheap evidence that a cut landed. */
+async function countClips(sequence) {
+  const [v, a] = await Promise.all([sequence.getVideoTrackCount(), sequence.getAudioTrackCount()]);
+  let n = 0;
+  for (let i = 0; i < v; i++) {
+    const t = await sequence.getVideoTrack(i);
+    n += (t.getTrackItems(ppro.Constants.TrackItemType.CLIP, false) || []).filter(Boolean).length;
+  }
+  for (let i = 0; i < a; i++) {
+    const t = await sequence.getAudioTrack(i);
+    n += (t.getTrackItems(ppro.Constants.TrackItemType.CLIP, false) || []).filter(Boolean).length;
+  }
+  return n;
+}
 
 /* --------------------------------------------------------------- dispatch */
 
