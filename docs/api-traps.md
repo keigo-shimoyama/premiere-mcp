@@ -249,3 +249,26 @@ broken (unlinked audio; gaps left open).
 
 **Rule: after every batch, re-read the state and compare it against what was
 expected.** The invariant applies on the way out, not only on the way in.
+
+## 14. Many small transactions poison the panel
+
+**Observed, 2026-11-15** (project-panel cleanup, about 470 bin moves). With one
+`executeTransaction` per move (`__bins` op `move`), after roughly 74–88
+transactions every further write failed with `The script object is no longer
+valid.`, while reads (`__tree`) still worked. Reloading the panel in UXP
+Developer Tool cleared it, and it failed again after about another 80.
+
+**Rule:** use `__bins` only for the few `mkbin` / `rename` calls, and put all
+moves into **one** transaction with `__binsBatch` (`[{id, binId}, …]`; it walks
+the tree once, then calls `createMoveItemAction` for every op inside a single
+`lockedAccess` + `executeTransaction`). A failed single move may still have
+happened, so after any failure re-read `__tree` and recompute what is left.
+
+**Observed, 2026-11-19–20:** `location.reload()` from the panel itself clears
+the write failure; the panel reconnects to the proxy automatically. The panel
+counts every `executeTransaction` call, including calls that throw, and schedules
+a self-reload after the response when the count reaches 50 (configurable via
+`localStorage.pproReloadAt`) or a write reports `The script object is no longer
+valid.` Check `panel.txCount` during long write runs; `ppro_panel_reload` can
+reload explicitly. Even while a user operates Premiere's UI, references can
+occasionally go stale, so re-read project state after a failure.

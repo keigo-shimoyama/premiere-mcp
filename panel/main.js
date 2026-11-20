@@ -28,6 +28,15 @@ function appVersion() {
 
 const ENDPOINTS = ["ws://localhost:3001", "ws://127.0.0.1:3001"];
 const RECONNECT_MS = 2000;
+const RELOAD_DELAY_MS = 300;
+let configuredReloadAt = 0;
+try { configuredReloadAt = Number(window.localStorage?.getItem("pproReloadAt")); } catch (_) {}
+const RELOAD_AT = Number.isFinite(configuredReloadAt) && configuredReloadAt > 0
+  ? configuredReloadAt : 50;
+const loadedAt = new Date().toISOString();
+let txCount = 0;
+let staleErrors = 0;
+let reloadTimer = null;
 
 let ws = null;
 let endpointIndex = 0;
@@ -48,6 +57,40 @@ function log(msg, cls = "dim") {
 function setStatus(text, cls) {
   statusEl.textContent = text;
   statusEl.className = cls;
+}
+
+function isStaleError(error) {
+  return /The script object is no longer valid/i.test(String(error?.message || error || ""));
+}
+
+function execTx(project, fn, label) {
+  txCount++;
+  try {
+    return project.executeTransaction(fn, label);
+  } catch (error) {
+    if (isStaleError(error)) staleErrors++;
+    throw error;
+  }
+}
+
+function countedProject(project) {
+  return new Proxy(project, {
+    get(target, key) {
+      if (key === "executeTransaction") return (fn, label) => execTx(target, fn, label);
+      const value = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+function panelState() {
+  return { txCount, staleErrors, reloadAt: RELOAD_AT, loadedAt };
+}
+
+function scheduleReload(reason) {
+  if (reloadTimer) return;
+  reloadTimer = setTimeout(() => window.location.reload(), RELOAD_DELAY_MS);
+  log(`panel reload scheduled: ${reason}`);
 }
 
 /* ---------------------------------------------------------------- helpers */
@@ -167,6 +210,10 @@ async function collectClipProjectItems(folderItem, acc = [], depth = 0) {
 /* --------------------------------------------------------------- commands */
 
 const commands = {
+  async panel_reload() {
+    return { txCountBefore: txCount, loadedAtBefore: loadedAt };
+  },
+
   /** Round-trip proof. Returns app identity so we know we are really inside Premiere. */
   async echo(params) {
     return {
@@ -212,6 +259,7 @@ const commands = {
         ? { name: project.name, guid: String(project.guid), path: project.path }
         : null,
       sequence: sequenceInfo,
+      panel: panelState(),
       features: {
         // §4.4 — undo grouping
         executeTransaction: present(project, "executeTransaction"),
@@ -353,6 +401,188 @@ const commands = {
     const project = await ppro.Project.getActiveProject();
     const sequence = await project.getActiveSequence();
 
+    // __overwrite: args [projectItemId, seconds, videoTrackIndex, audioTrackIndex]。
+    // MCP 側のスキーマを変えずに「素材を指定トラックへ上書き配置」するための入口(コミットする)。
+    if (params.method === "__overwrite") {
+      const [pid, sec, vIdx, aIdx] = params.args || [];
+      const root = await project.getRootItem();
+      const found = await collectClipProjectItems(root);
+      const hit = found.find((c) => c.id === pid);
+      if (!hit) throw new Error(`no project item with id ${pid}`);
+      let err = null;
+      try {
+        project.lockedAccess(() => {
+          const editor = ppro.SequenceEditor.getEditor(sequence);
+          const act = editor.createOverwriteItemAction(
+            ppro.ProjectItem.cast(hit.clip), ppro.TickTime.createWithSeconds(sec), vIdx, aIdx);
+          execTx(project, (tx) => { tx.addAction(act); }, `agent: overwrite ${hit.name} @${sec}s V${vIdx}`);
+        });
+      } catch (e) { err = e?.message || String(e); }
+      return { called: "__overwrite", ok: !err, error: err };
+    }
+
+    // __shiftFrom: args [atSeconds, bySeconds]。開始が at 以降のクリップを全トラックで by 秒ずらす(1 トランザクション、コミットする)。
+    // 詰め用。順序を変えない範囲(左に詰めるなら、手前に by 以上の空きがある)で呼ぶこと(api-traps §5a)。
+    if (params.method === "__shiftFrom") {
+      const [at, by] = params.args || [];
+      if (typeof at !== "number" || typeof by !== "number") throw new Error("args [atSeconds, bySeconds]");
+      const [vCount, aCount] = await Promise.all([sequence.getVideoTrackCount(), sequence.getAudioTrackCount()]);
+      const tracks = [];
+      for (let i = 0; i < vCount; i++) tracks.push({ track: await sequence.getVideoTrack(i), id: `V${i}` });
+      for (let i = 0; i < aCount; i++) tracks.push({ track: await sequence.getAudioTrack(i), id: `A${i}` });
+      const targets = {};
+      let found = 0;
+      for (const { track, id } of tracks) {
+        const items = track.getTrackItems(ppro.Constants.TrackItemType.CLIP, false) || [];
+        targets[id] = [];
+        for (let i = 0; i < items.length; i++) {
+          if (!items[i]) continue;
+          const st = await items[i].getStartTime();
+          if (st.seconds >= at - 1e-4) { targets[id].push(i); found++; }
+        }
+      }
+      let err = null;
+      try {
+        const shift = ppro.TickTime.createWithSeconds(by);
+        project.lockedAccess(() => {
+          const actions = [];
+          for (const { track, id } of tracks) {
+            const items = track.getTrackItems(ppro.Constants.TrackItemType.CLIP, false) || [];
+            for (const i of targets[id]) if (items[i]) actions.push(items[i].createMoveAction(shift));
+          }
+          execTx(project, (tx) => { for (const a of actions) tx.addAction(a); },
+            `agent: shift ${found} clip(s) from ${at}s by ${by.toFixed(3)}s`);
+        });
+      } catch (e) { err = e?.message || String(e); }
+      return { called: "__shiftFrom", ok: !err, error: err, moved: found };
+    }
+
+    // __tree: プロジェクトパネルを再帰列挙。args [] → [{id,name,kind,parentId,depth}]
+    if (params.method === "__tree") {
+      const out = [];
+      async function walk(folder, parentId, depth) {
+        const items = await folder.getItems();
+        for (const item of items) {
+          const asFolder = ppro.FolderItem.cast(item);
+          const id = item.getId();
+          let kind = asFolder ? "bin" : "clip";
+          if (!asFolder) {
+            try {
+              const c = ppro.ClipProjectItem.cast(item);
+              if (c && typeof c.isSequence === "function" && (await c.isSequence())) kind = "sequence";
+            } catch (_) {}
+          }
+          out.push({ id, name: item.name, kind, parentId, depth });
+          if (asFolder && depth < 8) await walk(asFolder, id, depth + 1);
+        }
+      }
+      const root = await project.getRootItem();
+      await walk(root, "root", 0);
+      return { called: "__tree", ok: true, count: out.length, items: out };
+    }
+
+    // __bins: args [ {op:"mkbin", name, parentId?}, {op:"move", id, binId}, {op:"rename", id, name} ]
+    // 順に別トランザクションで実行(新規 bin は名前で引き直す)。parentId/binId は "root" 可。
+    if (params.method === "__bins") {
+      const ops = params.args || [];
+      const log = [];
+      async function findFolder(id) {
+        const root = await project.getRootItem();
+        if (id === "root" || !id) return root;
+        let hit = null;
+        async function w(f, d) {
+          for (const it of await f.getItems()) {
+            const af = ppro.FolderItem.cast(it);
+            if (af) { if (it.getId() === id) hit = af; if (!hit && d < 8) await w(af, d + 1); }
+            if (hit) return;
+          }
+        }
+        await w(root, 0);
+        return hit;
+      }
+      async function findItem(id) {
+        const root = await project.getRootItem();
+        let hit = null;
+        async function w(f, d) {
+          for (const it of await f.getItems()) {
+            if (it.getId() === id) { hit = it; return; }
+            const af = ppro.FolderItem.cast(it);
+            if (af && d < 8) { await w(af, d + 1); if (hit) return; }
+          }
+        }
+        await w(root, 0);
+        return hit;
+      }
+      for (const op of ops) {
+        let err = null, res = null;
+        try {
+          if (op.op === "mkbin") {
+            const parent = await findFolder(op.parentId);
+            if (!parent) throw new Error("no parent " + op.parentId);
+            const existing = (await parent.getItems()).find((i) => i.name === op.name && ppro.FolderItem.cast(i));
+            if (existing) { res = existing.getId(); }
+            else {
+              project.lockedAccess(() => {
+                const act = parent.createBinAction(op.name, true);
+                execTx(project, (tx) => { tx.addAction(act); }, `agent: mkbin ${op.name}`);
+              });
+              const made = (await parent.getItems()).find((i) => i.name === op.name && ppro.FolderItem.cast(i));
+              res = made ? made.getId() : null;
+            }
+          } else if (op.op === "move") {
+            const item = await findItem(op.id);
+            const bin = await findFolder(op.binId);
+            if (!item || !bin) throw new Error("item or bin not found");
+            project.lockedAccess(() => {
+              const act = bin.createMoveItemAction(item, bin);
+              execTx(project, (tx) => { tx.addAction(act); }, `agent: move ${item.name}`);
+            });
+          } else if (op.op === "rename") {
+            const item = await findItem(op.id);
+            if (!item) throw new Error("item not found");
+            project.lockedAccess(() => {
+              const act = item.createSetNameAction(op.name);
+              execTx(project, (tx) => { tx.addAction(act); }, `agent: rename ${op.name}`);
+            });
+          }
+        } catch (e) { err = e?.message || String(e); }
+        log.push({ op: op.op, name: op.name, id: op.id, ok: !err, error: err, result: res });
+      }
+      return { called: "__bins", ok: true, log };
+    }
+
+    // __binsBatch: args [ {id, binId}, ... ]。木を 1 回だけ辿り、移動を 1 トランザクションにまとめる。
+    // (1 件ずつのトランザクションを 80 件ほど重ねると "The script object is no longer valid." で止まるため)
+    if (params.method === "__binsBatch") {
+      const ops = params.args || [];
+      const items = new Map(), folders = new Map();
+      const root = await project.getRootItem();
+      folders.set("root", root);
+      async function w(f, d) {
+        for (const it of await f.getItems()) {
+          items.set(it.getId(), it);
+          const af = ppro.FolderItem.cast(it);
+          if (af) { folders.set(it.getId(), af); if (d < 8) await w(af, d + 1); }
+        }
+      }
+      await w(root, 0);
+      const missing = ops.filter((op) => !items.has(op.id) || !folders.has(op.binId)).map((op) => op.id);
+      let err = null, added = 0;
+      try {
+        project.lockedAccess(() => {
+          execTx(project, (tx) => {
+            for (const op of ops) {
+              const item = items.get(op.id), bin = folders.get(op.binId);
+              if (!item || !bin) continue;
+              tx.addAction(bin.createMoveItemAction(item, bin));
+              added++;
+            }
+          }, `agent: move ${ops.length} items`);
+        });
+      } catch (e) { err = e?.message || String(e); }
+      return { called: "__binsBatch", ok: !err, error: err, added, missing };
+    }
+
     async function trackItemAt(spec) {
       const kind = String(spec.track).slice(0, 1).toUpperCase();
       const idx = Number(String(spec.track).slice(1));
@@ -368,6 +598,13 @@ const commands = {
         return out;
       }
       if (a === null || typeof a !== "object") return a;
+      if ("$sequenceGuid" in a) {
+        // 書き出し(encoder.exportSequence)用: guid でシーケンスを引く
+        const seqs = await project.getSequences();
+        const hit = seqs.find((s) => String(s.guid) === String(a.$sequenceGuid));
+        if (!hit) throw new Error(`sequence not found: ${a.$sequenceGuid}`);
+        return hit;
+      }
       if ("$seconds" in a) return ppro.TickTime.createWithSeconds(a.$seconds);
       if ("$ticks" in a) return ppro.TickTime.createWithTicks(String(a.$ticks));
       if ("$trackItem" in a) return await trackItemAt(a.$trackItem);
@@ -395,13 +632,423 @@ const commands = {
       return a;
     }
 
+    // __eval: args [{code | file, args, allowTraps}]
+    // 受け取った JavaScript(async 関数の本体)をパネルの中で実行し、return した値を返す。パネルを Reload せずに
+    // 処理を足すための口(manifest の requiredPermissions.allowCodeGenerationFromStrings が要る)。
+    // 本体から使える名前: ppro, project, sequence(アクティブ), args, log(...), trackItemAt, resolveArg, methodsOf,
+    // collectClipProjectItems, fs。書き込むときは api-traps の型(lockedAccess の中で取り直す、まとめて 1 トランザクション)に従う。
+    // api-traps §5a(並べ替えの createMoveAction)と §5b(トラックアイテムの In/Out 設定)は、allowTraps なしでは実行前に止める。
+    if (params.method === "__eval") {
+      const o = (params.args || [])[0] || {};
+      const fs = require("fs");
+      const code = o.file ? fs.readFileSync(o.file, { encoding: "utf-8" }) : String(o.code || "");
+      if (!code.trim()) throw new Error("__eval: code も file もありません");
+      if (!o.allowTraps) {
+        const bad = [/createMoveAction/, /createSetInPointAction/, /createSetOutPointAction/].filter((re) => re.test(code));
+        if (bad.length) throw new Error(`__eval: api-traps で禁止の API を含みます(${bad.map(String).join(", ")})。使うなら allowTraps: true`);
+      }
+      const logs = [];
+      const log = (...a) => logs.push(a.map((x) => {
+        if (typeof x === "string") return x;
+        try { return JSON.stringify(x); } catch (_) { return String(x); }
+      }).join(" "));
+      const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+      const t0 = Date.now();
+      let result, error = null;
+      try {
+        const fn = new AsyncFunction("ppro", "project", "sequence", "args", "log", "trackItemAt", "resolveArg",
+          "methodsOf", "collectClipProjectItems", "fs", code);
+        result = await fn(ppro, countedProject(project), sequence, o.args, log, trackItemAt, resolveArg, methodsOf, collectClipProjectItems, fs);
+      } catch (e) { error = (e && (e.stack || e.message)) || String(e); }
+      let out = result === undefined ? null : result;
+      try { out = JSON.parse(JSON.stringify(out)); } catch (_) { out = String(out); }
+      return { called: "__eval", ok: !error, error, result: out, logs, ms: Date.now() - t0 };
+    }
+
+    // __lumetriMove: args [{src, dst, map:[{src, dst}], copies, pools, limit, matchName}]
+    // Lumetri の Blob(埋め込み LUT)は API で読み書きできず、Component を別のチェーンに足すと「共有」になる。
+    // そこで src のシーケンスを copies 回複製し(アクティブは切り替えない)、複製のクリップから Lumetri を外して
+    // dst のクリップへ移す(1 つの Lumetri は 1 つのクリップだけが持つ)。dst に Lumetri があれば先に外す。
+    // pools: 前回作った複製のシーケンス名(続きから使う)。1 トラック 1 トランザクション。
+    if (params.method === "__lumetriMove") {
+      const o = (params.args || [])[0] || {};
+      const MATCH = o.matchName || "AE.ADBE Lumetri";
+      let seqs = await project.getSequences();
+      const srcSeq = seqs.find((s) => s.name === o.src), dstSeq = seqs.find((s) => s.name === o.dst);
+      if (!srcSeq || !dstSeq) throw new Error(`sequence not found: ${!srcSeq ? o.src : o.dst}`);
+      const out = { called: "__lumetriMove", pools: [], report: [] };
+      let pools = (o.pools || []).map((n) => seqs.find((s) => s.name === n)).filter(Boolean);
+      for (let c = 0; c < (o.copies || 0); c++) {
+        const beforeG = new Set(seqs.map((s) => String(s.guid)));
+        project.lockedAccess(() => {
+          execTx(project, (tx) => { tx.addAction(srcSeq.createCloneAction()); }, `agent: clone ${o.src} for Lumetri`);
+        });
+        seqs = await project.getSequences();
+        const fresh = seqs.filter((s) => !beforeG.has(String(s.guid)));
+        pools = pools.concat(fresh);
+      }
+      out.pools = pools.map((s) => ({ name: s.name, guid: String(s.guid) }));
+      async function itemsOf(seq, ti) {
+        const t = await seq.getVideoTrack(ti);
+        return t.getTrackItems(ppro.Constants.TrackItemType.CLIP, false) || [];
+      }
+      async function lumOf(item) {
+        const chain = await item.getComponentChain();
+        const n = chain.getComponentCount();
+        for (let i = 0; i < n; i++) {
+          const c = chain.getComponentAtIndex(i);
+          if ((await c.getMatchName()) === MATCH) return { chain, comp: c, n };
+        }
+        return { chain, comp: null, n };
+      }
+      for (const m of o.map || []) {
+        const r = { src: m.src, dst: m.dst };
+        try {
+          const pool = [];
+          for (const ps of pools) for (const it of await itemsOf(ps, m.src)) {
+            const L = await lumOf(it);
+            if (L.comp) pool.push({ L, it });
+          }
+          let D = await itemsOf(dstSeq, m.dst);
+          if (o.limit) D = D.slice(0, o.limit);
+          r.pool = pool.length; r.targets = D.length;
+          if (pool.length < D.length) throw new Error(`pool ${pool.length} < targets ${D.length}`);
+          const pairs = [];
+          for (let j = 0; j < D.length; j++) pairs.push({ d: await lumOf(D[j]), p: pool[j].L });
+          project.lockedAccess(() => {
+            execTx(project, (tx) => {
+              for (const { d, p } of pairs) {
+                if (d.comp) tx.addAction(d.chain.createRemoveComponentAction(d.comp));
+                tx.addAction(p.chain.createRemoveComponentAction(p.comp));
+                tx.addAction(d.chain.createAppendComponentAction(p.comp, d.comp ? d.n - 1 : d.n));
+              }
+            }, `agent: move Lumetri x${pairs.length} (track ${m.dst})`);
+          });
+          // 確かめ: dst は全件 Lumetri あり、使った pool のクリップは Lumetri なし
+          const D2 = (await itemsOf(dstSeq, m.dst)).slice(0, D.length);
+          let has = 0; for (const it of D2) if ((await lumOf(it)).comp) has++;
+          let left = 0; for (const x of pool.slice(0, D.length)) if ((await lumOf(x.it)).comp) left++;
+          r.dstWithLumetri = has; r.poolStillHas = left;
+        } catch (e) { r.error = e?.message || String(e); }
+        out.report.push(r);
+      }
+      out.ok = out.report.every((r) => !r.error);
+      return out;
+    }
+
+    // __lumetriCopy: args [{src, dst, map:[{src, dst, byCam}], dryRun, overwrite, matchName, blob:{dstTrack: path}, limit}]
+    // blob: Blob(パラメータ 0。LUT を埋め込んだ本体)は getStartValue で null になり写せない。prproj から取り出した
+    // <Lumetri> テキストのファイルをトラックごとに渡すと、それを入れる。limit: 1 トラックで当てる件数の上限(試し用)。
+    // シーケンス名で引く(アクティブを切り替えない)。src のビデオトラック map.src にある Lumetri の値を、
+    // dst のトラック map.dst の全クリップに当てる(コミットする)。byCam: クリップ名の「A7194@」「B214@」の
+    // 頭文字(A/B)ごとに別の元を使う(インサート用)。既定値と違うパラメータだけ写す。
+    // 1 トラックにつき「追加」と「値の設定」の 2 トランザクション(api-traps §14)。
+    if (params.method === "__lumetriCopy") {
+      const o = (params.args || [])[0] || {};
+      const MATCH = o.matchName || "AE.ADBE Lumetri";
+      const seqs = await project.getSequences();
+      const srcSeq = seqs.find((s) => s.name === o.src), dstSeq = seqs.find((s) => s.name === o.dst);
+      if (!srcSeq || !dstSeq) throw new Error(`sequence not found: ${!srcSeq ? o.src : o.dst}`);
+      const camOf = (name) => { const m = /(?:^|\s)([AB])\d+@/.exec(name || ""); return m ? m[1] : null; };
+      const key = (v) => { try { return JSON.stringify(v); } catch (_) { return String(v); } };
+      async function clipsOf(seq, ti) {
+        const t = await seq.getVideoTrack(ti);
+        return { name: t.name, items: t.getTrackItems(ppro.Constants.TrackItemType.CLIP, false) || [] };
+      }
+      async function lumOf(item) {
+        const chain = await item.getComponentChain();
+        const n = chain.getComponentCount();
+        for (let i = 0; i < n; i++) {
+          const c = chain.getComponentAtIndex(i);
+          if ((await c.getMatchName()) === MATCH) return { chain, comp: c, n };
+        }
+        return { chain, comp: null, n };
+      }
+      async function values(comp) {
+        const out = [];
+        const n = comp.getParamCount();
+        for (let i = 0; i < n; i++) {
+          const p = comp.getParam(i);
+          let v, err = null;
+          try { const k = await p.getStartValue(); v = k && typeof k === "object" && "value" in k ? k.value : k; }
+          catch (e) { err = e?.message || String(e); }
+          out.push({ i, name: p.displayName, v, err });
+        }
+        return out;
+      }
+      let defaults = null, defaultsErr = null;
+      try { defaults = await values(await ppro.VideoFilterFactory.createComponent(MATCH)); }
+      catch (e) { defaultsErr = e?.message || String(e); }
+      const report = [];
+      for (const m of o.map || []) {
+        const r = { src: m.src, dst: m.dst, byCam: !!m.byCam };
+        try {
+          const S = await clipsOf(srcSeq, m.src), D = await clipsOf(dstSeq, m.dst);
+          r.srcTrack = S.name; r.dstTrack = D.name;
+          const diffs = {};
+          for (const it of S.items) {
+            const k = m.byCam ? camOf(await it.getName()) : "*";
+            if (!k || diffs[k]) continue;
+            const { comp } = await lumOf(it);
+            if (!comp) continue;
+            const vals = await values(comp);
+            diffs[k] = vals.filter((x) => !x.err && x.v !== undefined &&
+              (!defaults || key(x.v) !== key(defaults[x.i] && defaults[x.i].v)));
+            diffs[k].from = await it.getName();
+          }
+          r.sources = Object.fromEntries(Object.entries(diffs).map(([k, d]) => [k, {
+            from: d.from, params: d.map((x) => `${x.i}:${x.name}=${String(key(x.v)).slice(0, 80)}`) }]));
+          const plan = [], skipped = [];
+          for (let j = 0; j < D.items.length; j++) {
+            const nm = await D.items[j].getName();
+            const k = m.byCam ? camOf(nm) : "*";
+            if (!k || !diffs[k]) { skipped.push(nm); continue; }
+            const L = await lumOf(D.items[j]);
+            if (L.comp && !o.overwrite) { skipped.push(nm + "(既にあり)"); continue; }
+            plan.push({ j, nm, k, chain: L.chain, has: !!L.comp, n: L.n });
+            if (o.limit && plan.length >= o.limit) break;
+          }
+          r.targets = plan.length; r.skipped = skipped;
+          // clone: 元のクリップの Lumetri(Component オブジェクト)そのものを先のチェーンに足してみる(Blob ごと写るか試す)。
+          // 先に Lumetri があれば外してから足す。元から消えていないかを src 側のエフェクト数で確かめる。
+          if (o.clone && !o.dryRun && plan.length) {
+            const srcComp = {};
+            for (const it of S.items) {
+              const k = m.byCam ? camOf(await it.getName()) : "*";
+              if (!k || srcComp[k]) continue;
+              const L = await lumOf(it);
+              if (L.comp) srcComp[k] = { comp: L.comp, item: it, n: L.n };
+            }
+            const c0 = plan[0];
+            r.chainMethods = methodsOf(c0.chain);
+            const before = Object.fromEntries(Object.entries(srcComp).map(([k, v]) => [k, v.n]));
+            const log = [];
+            for (const p of plan) {
+              try {
+                const L = await lumOf((await clipsOf(dstSeq, m.dst)).items[p.j]);
+                project.lockedAccess(() => {
+                  execTx(project, (tx) => {
+                    if (L.comp && typeof L.chain.createRemoveComponentAction === "function")
+                      tx.addAction(L.chain.createRemoveComponentAction(L.comp));
+                    tx.addAction(L.chain.createAppendComponentAction(srcComp[p.k].comp, L.comp ? L.n - 1 : L.n));
+                  }, `agent: clone Lumetri (${D.name})`);
+                });
+                log.push(p.nm + " ok");
+              } catch (e) { log.push(`${p.nm}: ${e?.message || e}`); }
+            }
+            r.cloneLog = log;
+            const after = {};
+            for (const [k, v] of Object.entries(srcComp)) after[k] = (await lumOf(v.item)).n;
+            r.srcCountBefore = before; r.srcCountAfter = after;
+            const chk = await lumOf((await clipsOf(dstSeq, m.dst)).items[plan[0].j]);
+            r.dstCount = chk.n; r.dstHasLumetri = !!chk.comp;
+            report.push(r);
+            continue;
+          }
+          if (!o.dryRun && plan.length) {
+            const toAdd = plan.filter((p) => !p.has);
+            for (const p of toAdd) p.made = await ppro.VideoFilterFactory.createComponent(MATCH);
+            project.lockedAccess(() => {
+              execTx(project, (tx) => {
+                for (const p of toAdd) tx.addAction(p.chain.createAppendComponentAction(p.made, p.n));
+              }, `agent: add Lumetri x${toAdd.length} (${D.name})`);
+            });
+            r.added = toAdd.length;
+            const fresh = await clipsOf(dstSeq, m.dst);
+            for (const p of plan) p.comp = (await lumOf(fresh.items[p.j])).comp;
+            // 既定値: createComponent からは読めない(getParamCount が無い)ので、いま足したばかりの Lumetri から読む
+            if (!defaults && toAdd.length) {
+              const f = plan.find((p) => !p.has && p.comp);
+              if (f) { try { defaults = await values(f.comp); } catch (e) { defaultsErr = String(e?.message || e); } }
+            }
+            // params: 写すパラメータ番号を明示(既定値が読めないとき用)。値は {value: x} の入れ子をほどいて渡す
+            const only = o.params ? new Set((o.params[m.dst] || o.params[String(m.dst)] || o.params["*"] || [])) : null;
+            const unwrap = (v) => (v && typeof v === "object" && "value" in v ? v.value : v);
+            for (const k of Object.keys(diffs)) {
+              const from = diffs[k].from;
+              diffs[k] = diffs[k].filter((x) => x.v !== null && x.i !== 0 && (only ? only.has(x.i) :
+                (!defaults || key(x.v) !== key(defaults[x.i] && defaults[x.i].v))));
+              diffs[k].from = from;
+            }
+            r.paramsSet = Object.fromEntries(Object.entries(diffs).map(([k, d]) => [k, d.map((x) => `${x.i}:${x.name}=${key(unwrap(x.v))}`)]));
+            // Blob(LUT を埋め込んだ Lumetri の本体)は API で読めないので、プロジェクトから取り出したテキストを入れる。
+            // 受け付ける型が分からないので、1 件目で文字列 → Uint8Array → ArrayBuffer の順に試し、通った型で残りを当てる
+            const blobPath = o.blob && (o.blob[m.dst] || o.blob[String(m.dst)]);
+            const blobText = blobPath ? require("fs").readFileSync(blobPath, { encoding: "utf-8" }) : null;
+            r.blob = blobPath ? `${blobPath} (${blobText.length})` : null;
+            const targets = plan.filter((p) => p.comp);
+            if (blobText && targets.length) {
+              const utf8 = (str) => { // TextEncoder が無いので手で UTF-8 にする
+                const out = [];
+                for (const ch of str) {
+                  const c = ch.codePointAt(0);
+                  if (c < 0x80) out.push(c);
+                  else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+                  else if (c < 0x10000) out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+                  else out.push(0xf0 | (c >> 18), 0x80 | ((c >> 12) & 63), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+                }
+                return new Uint8Array(out);
+              };
+              const enc = (md) => md === "string" ? blobText : md === "uint8" ? utf8(blobText) : utf8(blobText).buffer;
+              const tries = []; let mode = null;
+              const b0 = targets[0].comp.getParam(0);
+              for (const md of o.blobModes || ["string", "uint8", "buffer"]) {
+                try {
+                  const kf = b0.createKeyframe(enc(md));
+                  project.lockedAccess(() => {
+                    execTx(project, (tx) => { tx.addAction(b0.createSetValueAction(kf, true)); },
+                      `agent: set Lumetri blob (${D.name})`);
+                  });
+                  mode = md; break;
+                } catch (e) { tries.push(`${md}: ${e?.message || e}`); }
+              }
+              r.blobMode = mode; r.blobTries = tries;
+              if (mode && targets.length > 1) {
+                project.lockedAccess(() => {
+                  execTx(project, (tx) => {
+                    for (const p of targets.slice(1)) {
+                      const b = p.comp.getParam(0);
+                      tx.addAction(b.createSetValueAction(b.createKeyframe(enc(mode)), true));
+                    }
+                  }, `agent: set Lumetri blob x${targets.length - 1} (${D.name})`);
+                });
+              }
+            }
+            let nset = 0;
+            if (Object.values(diffs).some((d) => d.length)) {
+              project.lockedAccess(() => {
+                execTx(project, (tx) => {
+                  for (const p of targets) {
+                    for (const d of diffs[p.k]) {
+                      const prm = p.comp.getParam(d.i);
+                      tx.addAction(prm.createSetValueAction(prm.createKeyframe(unwrap(d.v)), true));
+                      nset++;
+                    }
+                  }
+                }, `agent: set Lumetri (${D.name})`);
+              });
+            }
+            r.set = nset;
+            // 確かめ: 1 件目を読み直して元と比べる
+            const chk = (await lumOf((await clipsOf(dstSeq, m.dst)).items[plan[0].j])).comp;
+            if (chk) {
+              const got = await values(chk);
+              r.verify = diffs[plan[0].k].map((d) => key(got[d.i] && got[d.i].v) === key(d.v));
+            }
+          }
+        } catch (e) { r.error = e?.message || String(e); }
+        report.push(r);
+      }
+      return { called: "__lumetriCopy", ok: report.every((r) => !r.error), defaultsErr, report };
+    }
+
+    // __fx: args [{track,index}, matchName, {paramDisplayName: value}|null]
+    // クリップにビデオエフェクトを追加し、表示名でパラメータを設定する(コミットする)。パラメータ一覧を返す。
+    if (params.method === "__fx") {
+      const [spec, matchName, setMap] = params.args || [];
+      const item = await trackItemAt(spec);
+      if (!item) throw new Error("no track item");
+      let err = null; let list = [];
+      try {
+        const chain = await item.getComponentChain();
+        let comp = null;
+        const before = chain.getComponentCount();
+        for (let i = 0; i < before; i++) {
+          const c = chain.getComponentAtIndex(i);
+          if ((await c.getMatchName()) === matchName) comp = c;
+        }
+        if (!comp) {
+          comp = await ppro.VideoFilterFactory.createComponent(matchName);
+          project.lockedAccess(() => {
+            execTx(project, (tx) => {
+              tx.addAction(chain.createAppendComponentAction(comp, before));
+            }, `agent: add ${matchName}`);
+          });
+          comp = chain.getComponentAtIndex(chain.getComponentCount() - 1);
+        }
+        const n = comp.getParamCount();
+        for (let i = 0; i < n; i++) {
+          const p = comp.getParam(i);
+          const nm = p.displayName;
+          list.push(nm);
+          if (setMap && Object.prototype.hasOwnProperty.call(setMap, nm)) {
+            project.lockedAccess(() => {
+              execTx(project, (tx) => {
+                tx.addAction(p.createSetValueAction(setMap[nm], true));
+              }, `agent: set ${nm}`);
+            });
+          }
+        }
+      } catch (e) { err = e?.message || String(e); }
+      return { called: "__fx", ok: !err, error: err, params: list };
+    }
+
+    // __param: args [{track,index} | [{track,index},...], matchName, paramIndex, "get"|"set", value|{"$file": path}]
+    // get: 1 件目の値(getStartValue)を返す。set: エフェクトが無ければ足し、createKeyframe で値を作って全件に設定する(コミットする)。
+    if (params.method === "__param") {
+      const [specArg, matchName, pIdx, mode, val] = params.args || [];
+      const specs = Array.isArray(specArg) ? specArg : [specArg];
+      async function compOf(item, add) {
+        const chain = await item.getComponentChain();
+        const n = chain.getComponentCount();
+        for (let i = 0; i < n; i++) {
+          const c = chain.getComponentAtIndex(i);
+          if ((await c.getMatchName()) === matchName) return c;
+        }
+        if (!add) return null;
+        const made = await ppro.VideoFilterFactory.createComponent(matchName);
+        project.lockedAccess(() => {
+          execTx(project, (tx) => { tx.addAction(chain.createAppendComponentAction(made, n)); }, `agent: add ${matchName}`);
+        });
+        return chain.getComponentAtIndex(chain.getComponentCount() - 1);
+      }
+      if (mode === "get") {
+        const item = await trackItemAt(specs[0]);
+        if (!item) throw new Error("no track item");
+        const comp = await compOf(item, false);
+        if (!comp) throw new Error("no component " + matchName);
+        const p = comp.getParam(pIdx);
+        let v = null, err = null;
+        try { v = await p.getStartValue(); } catch (e) { err = e?.message || String(e); }
+        const inner = v && typeof v === "object" && "value" in v ? v.value : v;
+        let out = inner;
+        if (inner && typeof inner === "object") { try { out = JSON.stringify(inner); } catch (_) { out = String(inner); } }
+        return { called: "__param", ok: !err, error: err, displayName: p.displayName, type: typeof inner,
+                 methods: v && typeof v === "object" ? methodsOf(v) : undefined,
+                 value: typeof out === "string" ? out.slice(0, 400000) : out };
+      }
+      let value = val;
+      if (val && typeof val === "object" && "$file" in val) {
+        value = require("fs").readFileSync(val.$file, { encoding: "utf-8" });
+      }
+      const log = [];
+      for (const spec of specs) {
+        let err = null;
+        try {
+          const item = await trackItemAt(spec);
+          if (!item) throw new Error("no track item");
+          const comp = await compOf(item, true);
+          const p = comp.getParam(pIdx);
+          const kf = p.createKeyframe(value);
+          project.lockedAccess(() => {
+            execTx(project, (tx) => { tx.addAction(p.createSetValueAction(kf, true)); }, `agent: set ${matchName}#${pIdx}`);
+          });
+        } catch (e) { err = e?.message || String(e); }
+        log.push({ spec, ok: !err, error: err });
+      }
+      return { called: "__param", ok: log.every((l) => l.ok), log };
+    }
+
     const targets = {
       trackItem: async () => await trackItemAt(params.on || { track: "V0", index: 0 }),
       sequenceEditor: () => ppro.SequenceEditor.getEditor(sequence),
       sequence: () => sequence,
       project: () => project,
       transcript: () => ppro.Transcript,
-      exporter: () => ppro.Exporter,
+      // exportSequence だけは EncoderManager に回す(MCP 側の target 列挙を変えずに書き出せるように)
+      // EncoderManager.exportSequence(sequence, ExportType, outputFile, presetFile, exportFull)
+      exporter: () => (params.method === "exportSequence" ? ppro.EncoderManager.getManager() : ppro.Exporter),
+      encoder: () => ppro.EncoderManager.getManager(),
     };
     const resolveTarget = targets[params.target];
     if (!resolveTarget) throw new Error(`unknown target: ${params.target}`);
@@ -488,7 +1135,7 @@ const commands = {
     let err = null;
     try {
       project.lockedAccess(() => {
-        project.executeTransaction((tx) => {
+        execTx(project, (tx) => {
           tx.addAction(source.createCloneAction());
         }, `agent: duplicate ${source.name}`);
       });
@@ -581,7 +1228,7 @@ const commands = {
             const items = track.getTrackItems(ppro.Constants.TrackItemType.CLIP, false) || [];
             if (items[index]) actions.push(items[index].createSetStartAction(at));
           }
-          project.executeTransaction((tx) => {
+          execTx(project, (tx) => {
             for (const a of actions) tx.addAction(a);
           }, `agent: trim head to ${params.atSeconds}s`);
         });
@@ -631,7 +1278,7 @@ const commands = {
               if (it) actions.push(it.createMoveAction(shiftTick));
             }
           }
-          project.executeTransaction((tx) => {
+          execTx(project, (tx) => {
             for (const a of actions) tx.addAction(a);
           }, `agent: close ${(-by).toFixed(2)}s gap`);
         });
@@ -710,7 +1357,7 @@ const commands = {
           const parent = i.getParentBin() || freshRoot;
           return parent.createRemoveItemAction(i);
         });
-        project.executeTransaction((tx) => {
+        execTx(project, (tx) => {
           for (const a of actions) tx.addAction(a);
         }, `agent: remove ${targets.length} scratch item(s)`);
       });
@@ -750,7 +1397,7 @@ const commands = {
       const pi = await target.getProjectItem();
       project.lockedAccess(() => {
         const action = pi.createSetNameAction(params.name);
-        project.executeTransaction((tx) => tx.addAction(action),
+        execTx(project, (tx) => tx.addAction(action),
           `agent: rename sequence to ${params.name}`);
       });
     } catch (e) {
@@ -865,7 +1512,7 @@ const commands = {
     let err = null;
     try {
       project.lockedAccess(() => {
-        project.executeTransaction((tx) => {
+        execTx(project, (tx) => {
           tx.addAction(item.createSetEndAction(at));
           for (const p of partners) tx.addAction(p.item.createSetEndAction(at));
         }, `agent: trim to ${params.atSeconds}s`);
@@ -971,7 +1618,7 @@ const commands = {
             if (it) actions.push(make(it, editor));
           }
         }
-        project.executeTransaction((tx) => {
+        execTx(project, (tx) => {
           for (const a of actions) tx.addAction(a);
         }, label);
       });
@@ -1115,7 +1762,7 @@ const commands = {
         const action = editor.createRemoveItemsAction(
           selection, ripple, ppro.Constants.MediaType.ANY, shiftOverlapping
         );
-        project.executeTransaction((tx) => tx.addAction(action),
+        execTx(project, (tx) => tx.addAction(action),
           `agent: remove clip at ${at}s${ripple ? " (ripple)" : ""}`);
       });
     } catch (e) {
@@ -1187,7 +1834,7 @@ const commands = {
           const items = track.getTrackItems(ppro.Constants.TrackItemType.CLIP, false) || [];
           for (const i of targets[id]) if (items[i]) actions.push(items[i].createMoveAction(shift));
         }
-        project.executeTransaction((tx) => {
+        execTx(project, (tx) => {
           for (const a of actions) tx.addAction(a);
         }, `agent: move ${found} clip(s) at ${at}s by ${by.toFixed(3)}s`);
       });
@@ -1280,7 +1927,7 @@ const commands = {
             actions.push(editor.createCloneTrackItemAction(items[i], offset, vo, ao, kind === "V", false));
           }
         }
-        project.executeTransaction((tx) => {
+        execTx(project, (tx) => {
           for (const a of actions) tx.addAction(a);
         }, `agent: clone ${found} clip(s) at ${at}s to +${by.toFixed(3)}s`);
       });
@@ -1370,7 +2017,7 @@ const commands = {
         if (!it) throw new Error("clip vanished between read and lock");
         const actions = wanted.map(([key, method]) =>
           it[method](ppro.TickTime.createWithSeconds(params[key])));
-        project.executeTransaction((tx) => {
+        execTx(project, (tx) => {
           for (const a of actions) tx.addAction(a);
         }, `agent: retrim ${params.track}[${index}]`);
       });
@@ -1461,7 +2108,7 @@ const commands = {
               if (items[i]) actions.push(items[i].createMoveAction(shift));
             }
           }
-          project.executeTransaction((tx) => {
+          execTx(project, (tx) => {
             for (const a of actions) tx.addAction(a);
           }, `agent: close ${best.gap.toFixed(3)}s gap at ${best.at.toFixed(2)}s`);
         });
@@ -1724,7 +2371,7 @@ const commands = {
         const action = markers.createAddMarkerAction(
           params.name, type, at, dur, params.comments || ""
         );
-        project.executeTransaction((tx) => tx.addAction(action), `agent: add marker ${params.name}`);
+        execTx(project, (tx) => tx.addAction(action), `agent: add marker ${params.name}`);
       });
     } catch (e) {
       err = e?.message || String(e);
@@ -1752,7 +2399,7 @@ const commands = {
     try {
       project.lockedAccess(() => {
         const actions = doomed.map((m) => markers.createRemoveMarkerAction(m));
-        project.executeTransaction((tx) => {
+        execTx(project, (tx) => {
           for (const a of actions) tx.addAction(a);
         }, `agent: remove ${actions.length} marker(s)`);
       });
@@ -1803,15 +2450,23 @@ async function countClips(sequence) {
 
 async function handleCommand(msg) {
   const fn = commands[msg.command];
-  if (!fn) {
-    return { type: "response", id: msg.id, ok: false, error: `unknown command: ${msg.command}` };
-  }
+  const staleBefore = staleErrors;
+  let response;
   try {
+    if (!fn) throw new Error(`unknown command: ${msg.command}`);
     const result = await fn(msg.params || {});
-    return { type: "response", id: msg.id, ok: true, result };
+    if (staleErrors === staleBefore && isStaleError(JSON.stringify(result))) staleErrors++;
+    response = { type: "response", id: msg.id, ok: true, result };
   } catch (e) {
-    return { type: "response", id: msg.id, ok: false, error: e?.message || String(e) };
+    if (staleErrors === staleBefore && isStaleError(e)) staleErrors++;
+    response = { type: "response", id: msg.id, ok: false, error: e?.message || String(e) };
   }
+  const reason = msg.command === "panel_reload" ? "manual"
+    : staleErrors > staleBefore ? "stale error"
+      : txCount >= RELOAD_AT ? "transaction limit" : null;
+  response.panel = { ...panelState(), reloadScheduled: !!reason || !!reloadTimer,
+    reason: reason || (reloadTimer ? "pending" : null) };
+  return response;
 }
 
 /* ------------------------------------------------------------- connection */
@@ -1850,11 +2505,19 @@ function connect() {
     if (msg.type === "displaced") return log("displaced by another panel", "err");
     if (msg.type !== "command") return;
 
+    // 再読み込みを予約したあとに届いたコマンドは実行しない(途中で reload に切られるため)。
+    // client はこのエラー文の先頭を見て、再接続後に送り直す。
+    if (reloadTimer) {
+      ws.send(JSON.stringify({ type: "response", id: msg.id, ok: false,
+        error: "no premierepro panel connected (panel is reloading)" }));
+      return;
+    }
     log(`> ${msg.command}`);
     const response = await handleCommand(msg);
     log(response.ok ? `< ${msg.command} ok` : `< ${msg.command} failed: ${response.error}`,
         response.ok ? "ok" : "err");
     ws.send(JSON.stringify(response));
+    if (response.panel.reloadScheduled) scheduleReload(response.panel.reason);
   };
 
   ws.onerror = () => log("socket error", "err");

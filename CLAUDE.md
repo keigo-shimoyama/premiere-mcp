@@ -45,8 +45,11 @@ project after you; loose items at the root cost them time every round.
 - Group by kind (footage per camera, audio, graphics/PSD per deliverable) and
   sequences per deliverable, with only the newest version directly in each
   deliverable's bin.
-- Never delete project items or sequences. Move superseded ones into the
-  project's old-versions bin (`_old` if it has none).
+- **Always move superseded versions into the old bin one level below the
+  deliverable's bin** (`<deliverable>/old`; if the project already has one
+  there under another name, use that). Only the newest version stays directly
+  in the deliverable's bin.
+- Never delete project items or sequences unless the user asks for it.
 - Moving items between bins is a project mutation: snapshot first, batch the
   moves into few transactions, and re-read the bin tree afterwards to verify.
 - Say in the report what was moved where.
@@ -72,6 +75,37 @@ code that was never executing.
 Editing `panel/*.js` -> Reload in UDT. Editing `panel/manifest.json` -> Unload
 then Load. If a new command answers `unknown command:`, the panel did not
 reload.
+
+For long write runs, watch `ppro_env`'s `panel.txCount`; the panel reloads
+automatically near the limit. `ppro_panel_reload` reloads it explicitly and
+waits for reconnection.
+
+## One-off work without a Reload: `__eval`
+
+The panel has a script runner, so new one-off processing does **not** need a
+panel edit or a Reload. Write the script to a file, then send it:
+
+```
+ppro_debug_invoke {target: "project", method: "__eval",
+                   args: [{file: "/abs/path/script.js", args: {...}}]}
+```
+
+- The file is the body of an async function. It can use `ppro`, `project`,
+  `sequence` (the active one), `args`, `log(...)`, `trackItemAt`, `resolveArg`,
+  `methodsOf`, `collectClipProjectItems` and `fs`. Whatever it `return`s comes
+  back as `result` (JSON-serialised), with `logs`, `error` (stack) and `ms`.
+- `{code: "..."}` works instead of `file` for a few lines.
+- Scripts that contain `createMoveAction`, `createSetInPointAction` or
+  `createSetOutPointAction` are refused before running (rules 1 and 2 above).
+  `allowTraps: true` lifts that only for a move that keeps clip order (§5).
+- Everything else in this file still applies: snapshot first, re-acquire
+  items inside `lockedAccess`, batch into one transaction (§14), and verify by
+  re-reading — `ok: true` only means the script did not throw.
+- Keep reusable scripts in `scripts/eval/` (`smoke.js` is a read-only check).
+  When a script proves itself across tasks, promote it to a panel command or
+  an MCP tool.
+- Needs `requiredPermissions.allowCodeGenerationFromStrings` in the manifest
+  (in place since 2026-11-16).
 
 ## API working pattern
 

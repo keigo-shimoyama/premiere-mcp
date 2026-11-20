@@ -49,6 +49,27 @@ relay("ppro_env", {
   inputSchema: {},
 }, "env");
 
+server.registerTool("ppro_panel_reload", {
+  title: "Reload Premiere panel",
+  description: "Reloads the UXP panel after its reply, waits for reconnection, and resets its transaction counter.",
+  inputSchema: {},
+}, async () => {
+  try {
+    const before = await proxy.call("panel_reload");
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline) {
+      const env = await proxy.call("env");
+      if (env.panel?.loadedAt !== before.loadedAtBefore) {
+        return { content: [{ type: "text", text: JSON.stringify({ reloaded: true, txCountBefore: before.txCountBefore }) }] };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 500));
+    }
+    throw new Error("panel did not reconnect within 15 seconds");
+  } catch (e) {
+    return { isError: true, content: [{ type: "text", text: `panel_reload failed: ${e.message}` }] };
+  }
+});
+
 relay("ppro_timeline_dump", {
   title: "Dump timeline",
   description:

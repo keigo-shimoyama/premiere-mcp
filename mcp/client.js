@@ -7,6 +7,8 @@ import { randomUUID } from "node:crypto";
 
 const URL = process.env.PPRO_PROXY_URL || "ws://127.0.0.1:3001";
 const CALL_TIMEOUT_MS = Number(process.env.PPRO_CALL_TIMEOUT_MS || 65000);
+const PANEL_WAIT_MS = 15000;
+const PANEL_RETRY_MS = 500;
 
 export class ProxyClient {
   #ws = null;
@@ -42,7 +44,11 @@ export class ProxyClient {
         if (!entry) return;
         clearTimeout(entry.timer);
         this.#pending.delete(msg.id);
-        msg.ok ? entry.resolve(msg.result) : entry.reject(new Error(msg.error));
+        if (msg.ok) {
+          const result = msg.result;
+          entry.resolve(msg.panel && result && typeof result === "object" && !Array.isArray(result)
+            ? { ...result, panel: { ...(result.panel || {}), ...msg.panel } } : result);
+        } else entry.reject(new Error(msg.error));
       });
       ws.on("close", () => {
         this.#ws = null;
@@ -59,6 +65,18 @@ export class ProxyClient {
   }
 
   async call(command, params = {}) {
+    const deadline = Date.now() + PANEL_WAIT_MS;
+    for (;;) {
+      try {
+        return await this.#callOnce(command, params);
+      } catch (error) {
+        if (!error.message.startsWith("no premierepro panel connected") || Date.now() >= deadline) throw error;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(PANEL_RETRY_MS, deadline - Date.now())));
+      }
+    }
+  }
+
+  async #callOnce(command, params) {
     const ws = await this.#connect();
     const id = randomUUID();
     return new Promise((resolve, reject) => {

@@ -21,3 +21,7 @@ docs/*.d.ts
 # Local MCP server registration (machine-specific paths).
 .mcp.json
 .claude/settings.local.json
+
+# Local-only: case-specific scripts and backups of installed panels.
+_old/
+scripts/auto_cuts.mjs
