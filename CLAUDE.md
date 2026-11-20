@@ -31,6 +31,26 @@ only way back from the §5a corruption — undo does not save you there.
 
 Mutate a **duplicate** of the sequence, never the user's original.
 
+## After every editing task: tidy the bins
+
+End **every** task that touched a project (imports, new sequences, placed
+PSDs) by tidying the Project panel bins before you report. Editors open the
+project after you; loose items at the root cost them time every round.
+
+- If the project folder has its own rules for bins (its `CLAUDE.md`), follow
+  them; they win over this list.
+- Nothing loose at the root: every clip, PSD, audio file and sequence goes
+  into a bin. Follow the bins the project already has; create one only when no
+  existing bin fits.
+- Group by kind (footage per camera, audio, graphics/PSD per deliverable) and
+  sequences per deliverable, with only the newest version directly in each
+  deliverable's bin.
+- Never delete project items or sequences. Move superseded ones into the
+  project's old-versions bin (`_old` if it has none).
+- Moving items between bins is a project mutation: snapshot first, batch the
+  moves into few transactions, and re-read the bin tree afterwards to verify.
+- Say in the report what was moved where.
+
 ## Layer split
 
 ```
